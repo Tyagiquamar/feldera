@@ -14,6 +14,15 @@ import TabItem from '@theme/TabItem';
 
         ## Unreleased
 
+        - Cluster monitoring data that has gone stale is now reported as such
+          instead of being served as current. The cluster monitor is the only
+          writer of cluster monitor events and runs within the runner, so when
+          the runner dies, its last write kept reporting every service healthy
+          indefinitely. Once the latest event is older than 30 minutes it carries
+          `stale: true`, `GET /v0/cluster_healthz` reports `all_healthy: false`
+          and answers `503`, and the web console shows a banner instead of an
+          "Operational" status.
+
         - Breaking change (SQL): `=`, `<>` and `!=` are no longer allowed between
           `ROW` values, so some programs that used to compile are now rejected.
           The previous implementation of these operations did not follow the
