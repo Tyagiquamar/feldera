@@ -1213,12 +1213,17 @@ pipeline '{self.name}' to sync checkpoint '{uuid}'"""
         return self.client.get_remote_checkpoints(self.name)
 
     def sync_checkpoint_status(
-        self, uuid: str, incarnation_uuid: Optional[str] = None
+        self, uuid: UUID | str, incarnation_uuid: Optional[str] = None
     ) -> CheckpointStatus:
         """
         Checks the status of the given checkpoint sync operation.
         If the checkpoint is currently being synchronized, returns
-        `CheckpointStatus.Unknown`.
+        `CheckpointStatus.InProgress`.
+
+        `CheckpointStatus.Unknown` means either that the pipeline is
+        too old to report whether checkpoint sync in progress, or the
+        sync operation was not the most recent to complete with
+        success or with failure.
 
         Failures are not raised as runtime errors and must be explicitly
         checked.
@@ -1229,11 +1234,16 @@ pipeline '{self.name}' to sync checkpoint '{uuid}'"""
             to be clearly reported as `IncarnationUuidMismatch`.
         """
 
+        # Allow a UUID object to be passed in.
+        uuid = str(uuid)
+
         resp = self.client.sync_checkpoint_status(self.name, incarnation_uuid)
         success = resp.get("success")
         periodic = resp.get("periodic")
 
-        fail = resp.get("failure") or {}
+        running = resp.get("running")
+        if running is not None and uuid in running:
+            return CheckpointStatus.InProgress
 
         if uuid == success or uuid == periodic:
             return CheckpointStatus.Success
@@ -1245,8 +1255,11 @@ pipeline '{self.name}' to sync checkpoint '{uuid}'"""
             logging.error(f"failed to sync checkpoint '{uuid}': {failure.error}")
             return failure
 
-        if (success is None) or UUID(uuid) > UUID(success):
-            return CheckpointStatus.InProgress
+        if running is None:
+            # The pipeline is too old to report the running checkpoint
+            # sync operations, but we can make an educated guess.
+            if (success is None) or UUID(uuid) > UUID(success):
+                return CheckpointStatus.InProgress
 
         return CheckpointStatus.Unknown
 

@@ -31,6 +31,13 @@ from .helper import wait_for_condition
 
 
 LOGGER = logging.getLogger(__name__)
+
+# TEST-NET-1 (RFC 5737) is reserved for documentation and is not routed, so a
+# connection to it hangs in TCP connect instead of being refused.  A sync
+# pointed here stays in `running` long enough to observe deterministically,
+# where a sync against a reachable endpoint can finish before the first status
+# request arrives.
+BLACKHOLE_ENDPOINT = "http://192.0.2.1:9000"
 _CHECKPOINT_SYNC_BUCKET_ARCH = platform.machine().lower()
 
 
@@ -432,6 +439,56 @@ class TestCheckpointSync(SharedTestPipeline):
             assert self.pipeline.status() == PipelineStatus.STANDBY
             self.pipeline.activate()
 
+    def _sync_status(self) -> dict:
+        """Return the raw `/checkpoint/sync_status` response.
+
+        The SDK's `sync_checkpoint_status` collapses the response into a
+        `CheckpointStatus`, which hides `running`.
+        """
+        return self.pipeline.client.sync_checkpoint_status(self.pipeline.name)
+
+    def _drain_sync(self, uuid, timeout_s: float = 120.0) -> tuple[dict, bool]:
+        """Poll `/checkpoint/sync_status` until the sync of *uuid* finishes.
+
+        Asserts on every sample that *uuid* is visible, that is, that it is
+        either in `running` or recorded in `success`/`failure`.  The pipeline
+        inserts *uuid* into `running` before answering the sync request, and
+        moves it from `running` to `success`/`failure` under a single lock, so
+        a caller that polls after a sync request can never see the UUID
+        disappear.
+
+        `running` alone decides when the sync is over.  `success` and `failure`
+        are sticky records of the last sync to reach each outcome, so re-syncing
+        a UUID that already failed starts out matching `running` and `failure`
+        at once; reading the sticky record as completion would report the new
+        sync as finished before it began.
+
+        Returns the final status, and whether the poll caught the sync in
+        `running`: a sync that ends within one status round-trip is already over
+        by the first sample.
+        """
+        saw_running = False
+        end = time.monotonic() + timeout_s
+        while True:
+            status = self._sync_status()
+            if uuid in (status.get("running") or []):
+                saw_running = True
+            else:
+                terminal = (
+                    status.get("success"),
+                    (status.get("failure") or {}).get("uuid"),
+                )
+                assert uuid in terminal, (
+                    f"sync '{uuid}' is neither running nor finished: {status}"
+                )
+                return status, saw_running
+
+            if time.monotonic() > end:
+                raise TimeoutError(
+                    f"timed out after {timeout_s}s waiting for sync '{uuid}': {status}"
+                )
+            time.sleep(0.05)
+
     # =========================================================================
     # Tests
     # =========================================================================
@@ -814,6 +871,147 @@ class TestCheckpointSync(SharedTestPipeline):
         self.assertIsNone(
             status.get("periodic"),
             f"periodic should be None after failed sync, got: {status}",
+        )
+
+        self.pipeline.stop(force=True)
+        self.pipeline.clear_storage()
+
+    @enterprise_only
+    @single_host_only
+    def test_sync_status_running(self):
+        """
+        CREATE TABLE t0 (c0 INT, c1 VARCHAR);
+        CREATE MATERIALIZED VIEW v0 AS SELECT * FROM t0;
+        """
+        # `push_interval` defaults to None, so no periodic sync competes for
+        # `running` and the only entry can be the manual sync below.
+        self._configure_and_start()
+        processed, _ = self._insert_data_and_wait()
+        self.pipeline.checkpoint(wait=True)
+        chk_uuid, _ = self._latest_checkpoint(processed)
+
+        self.assertEqual(
+            self._sync_status().get("running"),
+            [],
+            "no sync has been requested yet",
+        )
+
+        uuid = self.pipeline.sync_checkpoint()
+        self.assertEqual(str(uuid), str(chk_uuid))
+
+        status, _ = self._drain_sync(uuid)
+        self.assertEqual(
+            status.get("success"), uuid, f"sync should have succeeded: {status}"
+        )
+
+        self.pipeline.stop(force=True)
+        self.pipeline.clear_storage()
+
+    @enterprise_only
+    @single_host_only
+    def test_sync_status_in_flight(self):
+        """
+        CREATE TABLE t0 (c0 INT, c1 VARCHAR);
+        CREATE MATERIALIZED VIEW v0 AS SELECT * FROM t0;
+        """
+        # The sync cannot finish against an unroutable endpoint, so the window
+        # in which it is running is wide enough to observe.  Without that, a
+        # sync can start and finish between the 202 and the first status
+        # request, and an implementation that never populated `running` would
+        # be indistinguishable from one that does.
+        self.pipeline.set_runtime_config(
+            build_runtime_config(
+                workers=FELDERA_TEST_NUM_WORKERS,
+                hosts=FELDERA_TEST_NUM_HOSTS,
+                fault_tolerance_model=FaultToleranceModel.AtLeastOnce,
+                storage=Storage(
+                    config=storage_cfg(self.pipeline.name, endpoint=BLACKHOLE_ENDPOINT)
+                ),
+                checkpoint_interval_secs=60,
+            )
+        )
+        self.pipeline.start()
+        processed, _ = self._insert_data_and_wait()
+        self.pipeline.checkpoint(wait=True)
+        chk_uuid, _ = self._latest_checkpoint(processed)
+
+        uuid = self.pipeline.sync_checkpoint()
+        self.assertEqual(str(uuid), str(chk_uuid))
+
+        def sync_is_running() -> bool:
+            return uuid in (self._sync_status().get("running") or [])
+
+        wait_for_condition(
+            f"checkpoint sync '{uuid}' is reported as running",
+            sync_is_running,
+            timeout_s=30.0,
+            poll_interval_s=0.2,
+        )
+
+        # Requesting the same checkpoint again while it is syncing coalesces
+        # with the sync in progress: same UUID back, and still one entry.
+        self.assertEqual(self.pipeline.sync_checkpoint(), uuid)
+        status = self._sync_status()
+        self.assertEqual(
+            status.get("running"),
+            [uuid],
+            f"a duplicate request must not add a second entry: {status}",
+        )
+        self.assertIsNone(
+            status.get("success"), f"nothing can have succeeded yet: {status}"
+        )
+
+        # Stopping while the sync is still in flight exercises the guard's
+        # release-on-drop path; the pipeline must stop rather than wait it out.
+        self.pipeline.stop(force=True)
+        self.pipeline.clear_storage()
+
+    @enterprise_only
+    @single_host_only
+    def test_sync_status_running_after_failure(self):
+        """
+        CREATE TABLE t0 (c0 INT, c1 VARCHAR);
+        CREATE MATERIALIZED VIEW v0 AS SELECT * FROM t0;
+        """
+        # Bad credentials fail every sync, which checks that a sync releases
+        # its slot in `running` however it ends.  A leaked slot would wedge the
+        # checkpoint: later requests to sync it are dropped as duplicates, and
+        # the status keeps reporting a sync that is no longer running.
+        self.pipeline.set_runtime_config(
+            build_runtime_config(
+                workers=FELDERA_TEST_NUM_WORKERS,
+                hosts=FELDERA_TEST_NUM_HOSTS,
+                fault_tolerance_model=FaultToleranceModel.AtLeastOnce,
+                storage=Storage(config=storage_cfg(self.pipeline.name, auth_err=True)),
+                checkpoint_interval_secs=60,
+            )
+        )
+        self.pipeline.start()
+        processed, _ = self._insert_data_and_wait()
+        self.pipeline.checkpoint(wait=True)
+        chk_uuid, _ = self._latest_checkpoint(processed)
+
+        uuid = self.pipeline.sync_checkpoint()
+        self.assertEqual(str(uuid), str(chk_uuid))
+
+        status, _ = self._drain_sync(uuid)
+        self.assertEqual(
+            (status.get("failure") or {}).get("uuid"),
+            uuid,
+            f"sync should have failed on bad credentials: {status}",
+        )
+
+        # Re-syncing the same checkpoint is accepted rather than rejected as
+        # already-failed, and fails the same way.  A local MinIO 403 usually
+        # lands before the first status request, so this does not try to catch
+        # the second sync in `running`; `test_sync_status_in_flight` covers that
+        # against an endpoint that cannot answer.
+        self.assertEqual(self.pipeline.sync_checkpoint(), uuid)
+        status, _ = self._drain_sync(uuid)
+        self.assertEqual(
+            (status.get("failure") or {}).get("uuid"),
+            uuid,
+            f"re-sync should have failed too: {status}",
         )
 
         self.pipeline.stop(force=True)
