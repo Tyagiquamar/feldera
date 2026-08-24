@@ -264,6 +264,12 @@ export type CheckpointMetadata = {
  */
 export type CheckpointResponse = {
   checkpoint_sequence_number: number
+  /**
+   * Pass back to `/checkpoint_status` to detect pipeline restarts.
+   *
+   * Only `None` if sent by an older pipeline.
+   */
+  incarnation_uuid?: string | null
 }
 
 /**
@@ -296,6 +302,12 @@ export type CheckpointSyncFailure = {
  */
 export type CheckpointSyncResponse = {
   checkpoint_uuid: string
+  /**
+   * Pass back to `/checkpoint/sync_status` to detect pipeline restarts.
+   *
+   * Only `None` if sent by an older pipeline.
+   */
+  incarnation_uuid?: string | null
 }
 
 /**
@@ -2457,7 +2469,13 @@ export type HeaderMatch = {
   pattern: string
 }
 
+/**
+ * Health of the cluster as a whole and of each of its services.
+ */
 export type HealthStatus = {
+  /**
+   * Whether every service is healthy.
+   */
   all_healthy: boolean
   api: ServiceStatus
   compiler: ServiceStatus
@@ -3807,10 +3825,10 @@ export type PipelineConfig = {
    * Pipelines that don't run heavy ad-hoc / Delta / Iceberg workloads
    * can leave this unset.
    *
-   * Sort/aggregate-heavy ad-hoc queries (especially at high `workers`
-   * counts) should set this explicitly. An under-sized pool surfaces as
-   * `ResourcesExhausted` on the failing query — the pipeline keeps
-   * running and only that query fails.
+   * Set this explicitly for ad-hoc queries, or Delta / Iceberg scans,
+   * over data too large for the default share. A pool that cannot hold
+   * the query surfaces as `ResourcesExhausted` on that query alone; the
+   * pipeline keeps running.
    *
    * No pool limit applied if no overall budget is configured.
    *
@@ -4272,6 +4290,10 @@ export type PostgresCdcReaderConfig = {
   ssl_client_pem?: string | null
   /**
    * True to enable hostname verification when using TLS. True by default.
+   *
+   * When false, the certificate chain is still verified against the
+   * trusted CA; only the requirement that the server name appears in the
+   * certificate is lifted.
    */
   verify_hostname?: boolean | null
 } & {
@@ -4328,6 +4350,10 @@ export type PostgresReaderConfig = {
   ssl_client_pem?: string | null
   /**
    * True to enable hostname verification when using TLS. True by default.
+   *
+   * When false, the certificate chain is still verified against the
+   * trusted CA; only the requirement that the server name appears in the
+   * certificate is lifted.
    */
   verify_hostname?: boolean | null
 } & {
@@ -4379,6 +4405,10 @@ export type PostgresTlsConfig = {
   ssl_client_pem?: string | null
   /**
    * True to enable hostname verification when using TLS. True by default.
+   *
+   * When false, the certificate chain is still verified against the
+   * trusted CA; only the requirement that the server name appears in the
+   * certificate is lifted.
    */
   verify_hostname?: boolean | null
 }
@@ -4427,6 +4457,10 @@ export type PostgresWriterConfig = {
   ssl_client_pem?: string | null
   /**
    * True to enable hostname verification when using TLS. True by default.
+   *
+   * When false, the certificate chain is still verified against the
+   * trusted CA; only the requirement that the server name appears in the
+   * certificate is lifted.
    */
   verify_hostname?: boolean | null
 } & {
@@ -5148,10 +5182,10 @@ export type RuntimeConfig = {
    * Pipelines that don't run heavy ad-hoc / Delta / Iceberg workloads
    * can leave this unset.
    *
-   * Sort/aggregate-heavy ad-hoc queries (especially at high `workers`
-   * counts) should set this explicitly. An under-sized pool surfaces as
-   * `ResourcesExhausted` on the failing query — the pipeline keeps
-   * running and only that query fails.
+   * Set this explicitly for ad-hoc queries, or Delta / Iceberg scans,
+   * over data too large for the default share. A pool that cannot hold
+   * the query surfaces as `ResourcesExhausted` on that query alone; the
+   * pipeline keeps running.
    *
    * No pool limit applied if no overall budget is configured.
    *
@@ -5493,10 +5527,27 @@ export type SampleStatistics = {
   t: string
 }
 
+/**
+ * Health of a single service derived from the retained cluster monitor events.
+ */
 export type ServiceStatus = {
+  /**
+   * Timestamp of the most recent cluster monitor event.
+   */
   checked_at: string
+  /**
+   * Whether the service passed its most recent health check.
+   */
   healthy: boolean
+  /**
+   * Human-readable report from the most recent health check.
+   */
   message: string
+  /**
+   * Approximate time the service last transitioned between healthy and unhealthy:
+   * the timestamp of the oldest retained consecutive cluster monitor event with the
+   * same `healthy` conclusion. Bounded by event retention.
+   */
   unchanged_since: string
 }
 
@@ -7082,11 +7133,20 @@ export type GetCheckpointSyncStatusData = {
      */
     pipeline_name: string
   }
-  query?: never
+  query?: {
+    /**
+     * Incarnation UUID returned by the `POST checkpoint/sync` request this status check is for. If given and it does not match the pipeline's current incarnation, the pipeline process has restarted since the sync was requested and the response is a 400 error rather than a status.
+     */
+    incarnation_uuid?: string | null
+  }
   url: '/v0/pipelines/{pipeline_name}/checkpoint/sync_status'
 }
 
 export type GetCheckpointSyncStatusErrors = {
+  /**
+   * The given `incarnation_uuid` does not match the pipeline's current incarnation (error code `IncarnationUuidMismatch`): the pipeline process has restarted since the sync was requested
+   */
+  400: ErrorResponse
   /**
    * Pipeline with that name does not exist
    */
@@ -7116,11 +7176,20 @@ export type GetCheckpointStatusData = {
      */
     pipeline_name: string
   }
-  query?: never
+  query?: {
+    /**
+     * Incarnation UUID returned by the `POST checkpoint` request this status check is for. If given and it does not match the pipeline's current incarnation, the pipeline process has restarted since the checkpoint was requested and the response is a 400 error rather than a status.
+     */
+    incarnation_uuid?: string | null
+  }
   url: '/v0/pipelines/{pipeline_name}/checkpoint_status'
 }
 
 export type GetCheckpointStatusErrors = {
+  /**
+   * The given `incarnation_uuid` does not match the pipeline's current incarnation (error code `IncarnationUuidMismatch`): the pipeline process has restarted since the checkpoint was requested
+   */
+  400: ErrorResponse
   /**
    * Pipeline with that name does not exist
    */

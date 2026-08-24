@@ -416,6 +416,8 @@ export const getClusterEvent = <ThrowOnError extends boolean = true>(
  * Required role: `read` or higher.
  *
  * Determine the latest cluster health via the latest cluster monitor event.
+ * Each service's `unchanged_since` reports the approximate time it last transitioned
+ * between healthy and unhealthy, bounded by event retention.
  */
 export const getClusterHealth = <ThrowOnError extends boolean = true>(
   options?: Options<GetClusterHealthData, ThrowOnError>
