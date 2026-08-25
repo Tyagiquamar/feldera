@@ -24,5 +24,5 @@ export {
     BooleanValue,
     type JsonProfiles
 } from './profile.js';
-export { type Dataflow, type SourcePositionRange } from './dataflow.js';
+export { type Dataflow, SourcePositionRange } from './dataflow.js';
 export { type Option } from './util.js';
